@@ -49,6 +49,19 @@ ComputeDefaultWarpPartition(const GemmWarpPolicyNode &policy, int M, int N,
   ICHECK(N % k_n_per_warp == 0)
       << "N must be divisible by " << k_n_per_warp << ", but got " << N;
 
+  // n_warp must both divide N and leave each warp a whole number of
+  // k_n_per_warp-wide MMA tiles along N, i.e. warp_col_tiles = N / n_warp must
+  // stay an integer multiple of k_n_per_warp. Otherwise the per-warp tile
+  // cannot be sliced into MMA instructions (e.g. N = 24 with n_warp = 2 gives
+  // warp_col_tiles = 12, which fits neither 16-wide nor 8-wide MMA tiles; and
+  // N = 136 with n_warp = 16 covers only 128 columns because 16 does not divide
+  // 136). N % (n * k_n_per_warp) == 0 states exactly "n divides N and
+  // (N / n) % k_n_per_warp == 0"; unlike the truncating (N / n) %
+  // k_n_per_warp == 0 form it cannot accept an n that leaves N % n != 0.
+  auto valid_n_warp = [N, k_n_per_warp](int n) {
+    return N % (n * k_n_per_warp) == 0;
+  };
+
   if (policy.IsFullRow()) {
     int best_m = 1;
     int best_n = 1;
@@ -61,6 +74,10 @@ ComputeDefaultWarpPartition(const GemmWarpPolicyNode &policy, int M, int N,
       int n = num_warps / best_m;
       if (n != 0) {
         best_n = n;
+      }
+      // Shrink n_warp until every warp covers whole MMA tiles.
+      while (best_n > 1 && !valid_n_warp(best_n)) {
+        --best_n;
       }
     } else {
       best_m = max_m_warp;
@@ -75,6 +92,10 @@ ComputeDefaultWarpPartition(const GemmWarpPolicyNode &policy, int M, int N,
     int max_n_warp = N / k_n_per_warp;
     if (max_n_warp > num_warps) {
       best_n = num_warps;
+      // Shrink n_warp until every warp covers whole MMA tiles.
+      while (best_n > 1 && !valid_n_warp(best_n)) {
+        --best_n;
+      }
     } else if (max_m_warp * max_n_warp > num_warps) {
       best_n = max_n_warp;
       int m = num_warps / best_n;
@@ -102,6 +123,8 @@ ComputeDefaultWarpPartition(const GemmWarpPolicyNode &policy, int M, int N,
       if (m_per_warp < 1 || n_per_warp < 1)
         continue;
       if (m * n != num_warps)
+        continue;
+      if (!valid_n_warp(n))
         continue;
 
       float balance = std::abs(m_per_warp / n_per_warp - ideal_ratio);
@@ -144,7 +167,11 @@ struct Gemm {
                        int block_size, Target target, String gemm_inst) {
     int num_warps = block_size / TargetPPUGetWarpSize(target);
     // PPU MMA uses m16n16 tiles, so each warp needs at least 16 columns.
-    constexpr int kNPerWarp = 16;
+    // Shapes with N only divisible by 8 (e.g. block_N = 8/24 lowered to the
+    // cutlass3-backed m16n8k16 MMA fallback) need just 8 columns per warp,
+    // so relax kNPerWarp to 8 for them. N % 16 == 0 keeps the historical
+    // kNPerWarp = 16 partition behavior bit-identical.
+    const int kNPerWarp = (N % 16 == 0) ? 16 : 8;
     return ComputeDefaultWarpPartition(policy, M, N, num_warps, kNPerWarp);
   }
 

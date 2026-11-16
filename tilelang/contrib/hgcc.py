@@ -8,7 +8,7 @@ import subprocess
 import tempfile
 
 from tilelang import tvm as tvm
-from tilelang.env import TILELANG_TEMPLATE_PATH, ACTLIZE_INCLUDE_DIR, env
+from tilelang.env import TILELANG_TEMPLATE_PATH, ACTLIZE_INCLUDE_DIR, CUTLASS3_INCLUDE_DIR, env
 from tvm.target import Target
 
 
@@ -186,6 +186,19 @@ def compile_ppu(
         cmd_options += ["-I" + ACTLIZE_INCLUDE_DIR, "-DPPU_DEFAULT"]
     else:
         cmd_options += ["-DPPU_COMPATIBLE"]
+
+    # cutlass3 (CUTLASS 3.x cute atoms for MMA fallback shapes that actlize
+    # does not provide, e.g. SM80 16x8x16 on PPU0015). Only enabled when the
+    # cutlass3 include dir exists and the target arch is PPU0015 or newer
+    # (get_target_arch_int >= 15, same normalization as get_target_arch's
+    # "ppu_15"/"ppu_10" split); PPU0010 keeps its historical compile options
+    # untouched and mma.h's static_assert rejects unsupported 16x8 configs.
+    if CUTLASS3_INCLUDE_DIR and get_target_arch_int(compute_version) >= 15:
+        cmd_options += [
+            "-I" + CUTLASS3_INCLUDE_DIR,
+            "-DTL_PPU_HAS_CUTLASS3",
+            "-DCUTE_ARCH_MMA_SM80_ENABLED",
+        ]
 
     # Merge extra options
     if options:

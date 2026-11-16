@@ -32,6 +32,71 @@ def ldmatrix_trans_32x8_to_shared_16x16_layout(thread_id, local_id):
     return row, col
 
 
+def ldmatrix_32x4_to_shared_16x8_layout_b_fp16(thread_id, local_id):
+    """m16n8k16 fallback B addressing, K-major shared tile (k16 x n8).
+
+    ldmatrix.x2 with .trans loads two 8x8 fp16 matrices using the addresses
+    from lanes 0-15: matrix 0 covers k rows 0-7 at n column 0, matrix 1
+    covers k rows 8-15 at n column 0.  Together they produce the B fragment
+    of the SM80_16x8x16_F32F16F16F32_TN atom (BLayout
+    ((4,8),(2,2)):((16,1),(8,64)), see
+    3rdparty/cutlass3/include/cute/atom/mma_traits_sm80.hpp): lane t holds
+    b[0..3] with n = t // 4 and k = 2 * (t % 4) + (local % 2) + 8 * (local // 2).
+    Addresses supplied by lanes 16-31 are ignored by .x2; keep them inside
+    the tile so index expressions stay in bounds.
+    """
+    row = thread_id % 16
+    col = 0
+    return row, col
+
+
+def ldmatrix_32x4_to_shared_8x16_layout_b_fp16(thread_id, local_id):
+    """m16n8k16 fallback B addressing, N-major shared tile (n8 x k16).
+
+    ldmatrix.x2 without .trans loads two 8x8 fp16 matrices from lanes 0-15:
+    matrix 0 covers n rows 0-7 at k column 0, matrix 1 covers the same n
+    rows at k column 8.  Produces the same SM80_16x8x16 B fragment as the
+    K-major variant above.
+    """
+    row = thread_id % 8
+    col = 8 * ((thread_id % 16) // 8)
+    return row, col
+
+
+def ldmatrix_32x8_to_shared_8x32_layout_b(thread_id, local_id):
+    """m16n8k32 int8 fallback B addressing, N-major shared tile (n8 x k32).
+
+    ldmatrix.x2 without .trans loads two 8x16 int8 matrices using the
+    addresses from lanes 0-15: matrix 0 covers n rows 0-7 at k columns
+    0-15, matrix 1 the same n rows at k columns 16-31.  Produces the
+    SM80_16x8x32_S32S8S8S32_TN B fragment (BLayout
+    ((4,8),(4,2)):((32,1),(8,128)), see
+    3rdparty/cutlass3/include/cute/atom/mma_traits_sm80.hpp:264-278),
+    decoded below.  Addresses supplied by lanes 16-31 are ignored by
+    .x2; keep them inside the tile so index expressions stay in bounds.
+    """
+    row = thread_id % 8
+    col = 16 * ((thread_id % 16) // 8)
+    return row, col
+
+
+def ldmatrix_32x2_to_shared_8x8_layout_b_fp32(thread_id, local_id):
+    """m16n8k8 tf32 fallback B addressing, N-major shared tile (n8 x k8).
+
+    ldmatrix.x2 without .trans loads two 8x8 fp32 matrices using the
+    addresses from lanes 0-15: matrix 0 covers n rows 0-7 at k column 0,
+    matrix 1 the same n rows at k column 4.  Produces the
+    SM80_16x8x8_F32TF32TF32F32_TN B fragment (BLayout
+    ((4,8),_2):((8,1),_32), see
+    3rdparty/cutlass3/include/cute/atom/mma_traits_sm80.hpp:162-177),
+    decoded below.  Addresses supplied by lanes 16-31 are ignored by
+    .x2; keep them inside the tile so index expressions stay in bounds.
+    """
+    row = thread_id % 8
+    col = 4 * ((thread_id % 16) // 8)
+    return row, col
+
+
 def ldmatrix_32x16_to_shared_16x32_layout_a(thread_id, local_id):
     row = thread_id % 16
     col = local_id + (thread_id // 16) * 16
@@ -63,6 +128,20 @@ def ldmatrix_32x16_to_shared_16x64_layout_b(thread_id, local_id):
 def mma_store_32x8_to_shared_16x16_layout(thread_id, local_id):
     row = 8 * (local_id % 4 // 2) + (thread_id // 4)
     col = 8 * (local_id // 4) + (thread_id % 4) * 2 + (local_id % 2)
+    return row, col
+
+
+def mma_store_32x4_to_shared_16x8_layout(thread_id, local_id):
+    """C store mapping for the m16n8 fp32 accumulator (SM80_16x8_Row).
+
+    CLayout ((4,8),(2,2)):((32,1),(16,8)) decodes to: lane t holds c[0..3]
+    with row = t // 4 + 8 * (local // 2) and col = 2 * (t % 4) + (local % 2).
+    Identical to mma_store_32x8_to_shared_16x16_layout restricted to
+    local_id < 4 (the first n-octet of the m16n16 accumulator), spelled
+    out for the PPU0015 m16n8k16 fallback.
+    """
+    row = thread_id // 4 + 8 * (local_id // 2)
+    col = (thread_id % 4) * 2 + (local_id % 2)
     return row, col
 
 
@@ -122,6 +201,54 @@ shared_16x16_to_mma_32x8_layout_sr_a = shared_16x16_to_mma_a_32x8_layout
 shared_16x16_to_mma_32x8_layout_sr_b = shared_16x16_to_mma_b_32x8_layout
 shared_16x16_to_mma_32x8_layout_rs_a = shared_16x16_to_mma_a_32x8_layout_trans
 shared_16x16_to_mma_32x8_layout_rs_b = shared_16x16_to_mma_b_32x8_layout_trans
+
+
+def shared_8x16_to_mma_b_32x4_layout(i, j):
+    """B fragment inverse map for the m16n8k16 fp16 atom (n8 x k16 tile).
+
+    Given shared coordinates (i = n in [0, 8), j = k in [0, 16)), returns
+    (thread_id, local_id) of the SM80_16x8x16 BLayout
+    ((4,8),(2,2)):((16,1),(8,64)): lane t holds b[0..3] with
+    n = t // 4 and k = 2 * (t % 4) + (local % 2) + 8 * (local // 2).
+    Identical on this domain to shared_16x16_to_mma_b_32x8_layout
+    restricted to i < 8.
+    """
+    thread_id = 4 * i + (j % 8) // 2
+    local_id = 2 * (j // 8) + (j % 2)
+    return thread_id, local_id
+
+
+def shared_8x8_to_mma_b_32x2_layout(i, j):
+    """B fragment inverse map for the m16n8k8 tf32 atom (n8 x k8 tile).
+
+    Given shared coordinates (i = n in [0, 8), j = k in [0, 8)), returns
+    (thread_id, local_id) of the SM80_16x8x8_F32TF32TF32F32_TN BLayout
+    ((4,8),_2):((8,1),_32) (3rdparty/cutlass3/include/cute/atom/
+    mma_traits_sm80.hpp:162-177): lane t holds b[0..1] with
+    n = t // 4 and k = (t % 4) + 4 * local.  Identical on this domain to
+    shared_16x8_to_mma_b_32x4_layout restricted to local_id < 2 (the
+    first n-octet of the m16n16 tf32 B fragment).
+    """
+    thread_id = 4 * i + (j % 4)
+    local_id = j // 4
+    return thread_id, local_id
+
+
+def shared_8x32_to_mma_b_32x8_layout(i, j):
+    """B fragment inverse map for the m16n8k32 int8 atom (n8 x k32 tile).
+
+    Given shared coordinates (i = n in [0, 8), j = k in [0, 32)), returns
+    (thread_id, local_id) of the SM80_16x8x32_S32S8S8S32_TN BLayout
+    ((4,8),(4,2)):((32,1),(8,128)) (3rdparty/cutlass3/include/cute/
+    atom/mma_traits_sm80.hpp:264-278): lane t holds b[0..7] with
+    n = t // 4 and k = 4 * (t % 4) + local % 4 + 16 * (local // 4).
+    Identical on this domain to shared_16x32_to_mma_b_32x16_layout
+    restricted to i < 8 (the first n-octet of the m16n16 int8 B
+    fragment).
+    """
+    thread_id = 4 * i + (j // 4) % 4
+    local_id = (j % 4) + 4 * (j // 16)
+    return thread_id, local_id
 
 
 def shared_16x32_to_mma_a_32x16_layout(i, j):
@@ -191,6 +318,27 @@ def mma_load_a_32x8_to_shared_16x16_layout(thread_id, local_id):
 def mma_load_b_32x16_to_shared_16x32_layout(thread_id, local_id):
     row = 8 * (local_id // 8) + (thread_id // 4)
     col = 16 * (local_id % 8 // 4) + (thread_id % 4) * 4 + (local_id % 4)
+    return row, col
+
+
+def mma_load_b_32x2_to_shared_8x8_layout(thread_id, local_id):
+    """B forward map for the m16n8k8 tf32 atom: lane t local v holds the
+    shared element (n = t // 4, k = 4 * v + t % 4) — the forward direction
+    of shared_8x8_to_mma_b_32x2_layout / the SM80_16x8x8 BLayout above.
+    Used for K-major (non-transposed) element-wise B loads."""
+    row = thread_id // 4
+    col = 4 * local_id + (thread_id % 4)
+    return row, col
+
+
+def mma_load_b_32x8_to_shared_8x32_layout(thread_id, local_id):
+    """B forward map for the m16n8k32 int8 atom: lane t local v holds the
+    shared element (n = t // 4, k = 16 * (v // 4) + 4 * (t % 4) + v % 4)
+    — the forward direction of shared_8x32_to_mma_b_32x8_layout / the
+    SM80_16x8x32 BLayout above.  Used for K-major (non-transposed)
+    element-wise B loads."""
+    row = thread_id // 4
+    col = 16 * (local_id // 4) + (thread_id % 4) * 4 + (local_id % 4)
     return row, col
 
 

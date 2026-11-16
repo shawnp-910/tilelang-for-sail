@@ -3,6 +3,7 @@ import tilelang.language as T
 from typing import Literal
 from collections.abc import Callable
 from tilelang.transform import PassConfigKey, get_pass_context
+from tilelang.env import CUTLASS3_INCLUDE_DIR
 from tvm import DataType
 from tvm import tirx
 from tvm.ir import Range
@@ -38,6 +39,16 @@ from ..layout.mma_layout import (
     ldmatrix_32x16_to_shared_16x64_layout_a,
     ldmatrix_32x16_to_shared_16x64_layout_b,
     mma_store_32x8_to_shared_16x16_layout,
+    mma_store_32x4_to_shared_16x8_layout,
+    shared_8x16_to_mma_b_32x4_layout,
+    shared_8x8_to_mma_b_32x2_layout,
+    shared_8x32_to_mma_b_32x8_layout,
+    mma_load_b_32x2_to_shared_8x8_layout,
+    mma_load_b_32x8_to_shared_8x32_layout,
+    ldmatrix_32x4_to_shared_16x8_layout_b_fp16,
+    ldmatrix_32x4_to_shared_8x16_layout_b_fp16,
+    ldmatrix_32x2_to_shared_8x8_layout_b_fp32,
+    ldmatrix_32x8_to_shared_8x32_layout_b,
     # PPU-specific layout functions
     ppu_shared_16x16_to_mma_32x8_layout_trans_sr_b,
     ppu_ldmatrix_32x4_to_shared_16x8_layout_a,
@@ -470,11 +481,21 @@ class TensorCoreIntrinEmitter:
             if DataType(b_dtype).bits == 4:
                 mma_load_layout = mma_load_b_32x32_to_shared_16x64_layout
             elif DataType(b_dtype).bits == 8:
-                mma_load_layout = mma_load_b_32x16_to_shared_16x32_layout
+                if self.n_dim == 8:
+                    # m16n8k32 fallback: the int8 B fragment holds 8 s8 per
+                    # lane over an n8 x k32 tile (SM80_16x8x32 BLayout).
+                    mma_load_layout = mma_load_b_32x8_to_shared_8x32_layout
+                else:
+                    mma_load_layout = mma_load_b_32x16_to_shared_16x32_layout
             elif DataType(b_dtype).bits == 16:
                 mma_load_layout = mma_load_b_32x8_to_shared_16x16_layout
             elif DataType(b_dtype).bits == 32:
-                mma_load_layout = mma_load_b_32x4_to_shared_16x8_layout
+                if self.n_dim == 8:
+                    # m16n8k8 fallback: the tf32 B fragment holds 2 fp32 per
+                    # lane over an n8 x k8 tile (SM80_16x8x8 BLayout).
+                    mma_load_layout = mma_load_b_32x2_to_shared_8x8_layout
+                else:
+                    mma_load_layout = mma_load_b_32x4_to_shared_16x8_layout
             else:
                 raise ValueError(f"Unsupported dtype: {b_dtype}")
 
@@ -734,13 +755,33 @@ class TensorCoreIntrinEmitter:
         transform_func_sr_b: Callable = None
         if dtype_bits == 32:
             transform_func_sr_a = shared_16x8_to_mma_32x4_layout_sr_a
-            transform_func_sr_b = shared_16x8_to_mma_32x4_layout_sr_b
+            if matrix_is_b and self.n_dim == 8:
+                # m16n8k8 fallback: the tf32 B fragment holds 2 fp32 per lane
+                # over an n8 x k8 tile (SM80_16x8x8 BLayout); identical on
+                # this domain to the 16x16 map restricted to the first
+                # n-octet.
+                transform_func_sr_b = shared_8x8_to_mma_b_32x2_layout
+            else:
+                transform_func_sr_b = shared_16x8_to_mma_32x4_layout_sr_b
         elif dtype_bits == 16:
             transform_func_sr_a = shared_16x16_to_mma_32x8_layout_sr_a
-            transform_func_sr_b = shared_16x16_to_mma_32x8_layout_sr_b
+            if matrix_is_b and self.n_dim == 8:
+                # m16n8k16 fallback: the B fragment holds 4 fp16 per lane over
+                # an n8 x k16 tile (SM80_16x8x16 BLayout); identical on this
+                # domain to the 16x16 map restricted to the first n-octet.
+                transform_func_sr_b = shared_8x16_to_mma_b_32x4_layout
+            else:
+                transform_func_sr_b = shared_16x16_to_mma_32x8_layout_sr_b
         elif dtype_bits == 8:
             transform_func_sr_a = shared_16x32_to_mma_32x16_layout_sr_a
-            transform_func_sr_b = shared_16x32_to_mma_32x16_layout_sr_b
+            if matrix_is_b and self.n_dim == 8:
+                # m16n8k32 fallback: the int8 B fragment holds 8 s8 per lane
+                # over an n8 x k32 tile (SM80_16x8x32 BLayout); identical on
+                # this domain to the 16x16 map restricted to the first
+                # n-octet.
+                transform_func_sr_b = shared_8x32_to_mma_b_32x8_layout
+            else:
+                transform_func_sr_b = shared_16x32_to_mma_32x16_layout_sr_b
         else:
             raise ValueError(f"Unsupported dtype {dtype}")
 
@@ -956,11 +997,30 @@ class PPUTensorCoreIntrinEmitter(TensorCoreIntrinEmitter):
             and not self.a_transposed
         )
         if k_dim == 8:
-            self.mma_prefix = "m16n16k8"
+            if self.n_dim == 8:
+                self._check_m16n8_fallback_dtype(k_dim, a_dtype, b_dtype, accum_dtype)
+                self.mma_prefix = "m16n8k8"
+            else:
+                self.mma_prefix = "m16n16k8"
         elif k_dim == 16:
-            self.mma_prefix = "m16n16k16"
+            if self.n_dim == 8:
+                # PPU0015 fallback: native m16n8k16 atom, dispatched to the
+                # cute::SM80_16x8x16 atoms.  fp16 x fp16 (+ fp32/fp16) and
+                # bf16 x bf16 + fp32 are covered; every other dtype keeps the
+                # m16n16k16 path and its divisible-by-16 warp N slice
+                # requirement.
+                self._check_m16n8_fallback_dtype(k_dim, a_dtype, b_dtype, accum_dtype)
+                self.mma_prefix = "m16n8k16"
+            else:
+                self.mma_prefix = "m16n16k16"
         elif k_dim == 32 and (is_ppu0010_int8 or (self.ppu_arch >= 15 and not DataType(self.a_dtype).is_float4_e2m1fn())):
-            self.mma_prefix = "m16n16k32"
+            if self.n_dim == 8:
+                # PPU0015 fallback: native m16n8k32 int8 atom, dispatched to
+                # cute::SM80_16x8x32_S32S8S8S32_TN.  fp8 has no 16x8 fallback.
+                self._check_m16n8_fallback_dtype(k_dim, a_dtype, b_dtype, accum_dtype)
+                self.mma_prefix = "m16n8k32"
+            else:
+                self.mma_prefix = "m16n16k32"
         elif (
             k_dim == 64 and self.ppu_arch >= 15 and DataType(self.a_dtype).is_float4_e2m1fn() and DataType(self.b_dtype).is_float4_e2m1fn()
         ):
@@ -969,25 +1029,150 @@ class PPUTensorCoreIntrinEmitter(TensorCoreIntrinEmitter):
         else:
             raise ValueError(f"Unsupported k_dim {k_dim}")
 
+    def _is_tf32_mma_operand(self, dtype: str, accum_dtype: str) -> bool:
+        """Mirror the main 16x16 path's tf32 operand identification.
+
+        tilelang expresses tf32 operands in two spellings, both accepted by
+        the main path: custom[tfloat32] (whose dtype_abbrv entry is already
+        "tf32") and plain float32 (which _initialize_abbrev turns into "tf32"
+        via _should_use_tf32_mma_operand when the accumulator is float32).
+        """
+        if self._get_dtype_abbrv(dtype) == "tf32":
+            return True
+        return self._should_use_tf32_mma_operand(dtype, accum_dtype)
+
+    def _m16n8_fallback_dtype_supported(self, k_dim: int) -> bool:
+        """Whether the (a, b, accum) dtype combination has a native m16n8
+        MMA atom for this k_dim on PPU0015+.
+
+        Supported fallback combinations (matching the cute::SM80_16x8*
+        atoms the C++ side dispatches to):
+        - k_dim == 16: fp16 x fp16 + fp32, fp16 x fp16 + fp16,
+          bf16 x bf16 + fp32  (SM80_16x8x16 atoms, m16n8k16)
+        - k_dim == 8:  tf32 x tf32 + fp32, i.e. custom[tfloat32] operands
+          or plain fp32 x fp32 + fp32
+          (SM80_16x8x8_F32TF32TF32F32_TN, m16n8k8)
+        - k_dim == 32: int8 x int8 + int32
+          (SM80_16x8x32_S32S8S8S32_TN, m16n8k32)
+
+        Every other combination (fp64, fp8, fp4, sparse, ...) has no 16x8
+        fallback and keeps requiring a warp N slice divisible by 16.
+        """
+        a_dtype = DataType(self.a_dtype)
+        b_dtype = DataType(self.b_dtype)
+        accum_dtype = DataType(self.accum_dtype)
+        if k_dim == 16:
+            if (
+                a_dtype == DataType("float16")
+                and b_dtype == DataType("float16")
+                and accum_dtype in (DataType("float32"), DataType("float16"))
+            ):
+                return True
+            return (
+                a_dtype == DataType("bfloat16")
+                and b_dtype == DataType("bfloat16")
+                and accum_dtype == DataType("float32")
+            )
+        if k_dim == 8:
+            # tilelang expresses tf32 operands either as custom[tfloat32]
+            # (abbrv "tf32" directly, e.g. T.tfloat32) or as plain float32
+            # (the abbrev pass turns them into "tf32" when the accumulator
+            # is float32); mirror the main path's identification so both
+            # spellings hit the tf32 n8 fallback.
+            return (
+                self._is_tf32_mma_operand(self.a_dtype, self.accum_dtype)
+                and self._is_tf32_mma_operand(self.b_dtype, self.accum_dtype)
+                and accum_dtype == DataType("float32")
+            )
+        if k_dim == 32:
+            return (
+                a_dtype == DataType("int8")
+                and b_dtype == DataType("int8")
+                and accum_dtype == DataType("int32")
+            )
+        return False
+
+    def _check_m16n8_fallback_dtype(self, k_dim: int, a_dtype, b_dtype, accum_dtype) -> None:
+        """Raise a clear error when n_dim == 8 has no supported m16n8 atom."""
+        if self.ppu_arch < 15 or not self._m16n8_fallback_dtype_supported(k_dim):
+            raise ValueError(
+                "The m16n8 MMA fallback on PPU0015+ supports fp16 x fp16 + fp32/fp16, "
+                "bf16 x bf16 + fp32, fp32(tf32) x fp32(tf32) + fp32 and int8 x int8 + int32, "
+                f"got {self.a_dtype} x {self.b_dtype} + {self.accum_dtype} "
+                f"(k_dim={k_dim}, ppu_arch={self.ppu_arch}); this dtype has no 16x8 "
+                "fallback, keep the warp N slice divisible by 16"
+            )
+        # The m16n8 atoms are dispatched (via T.ptx_mma) to the cute::SM80_16x8*
+        # traits from the CUTLASS 3.x headers: hgcc only compiles that
+        # dispatcher in when the cutlass3 include dir was found (TL_PPU_HAS_CUTLASS3,
+        # see tilelang/contrib/hgcc.py).  Reject the fallback early here instead
+        # of letting the user run into deep C++ template errors from mma.h.
+        if not CUTLASS3_INCLUDE_DIR:
+            raise ValueError(
+                "The m16n8 MMA fallback requires the CUTLASS 3.x (cute) headers, but "
+                "the cutlass3 include directory was not found; set TL_CUTLASS3_PATH "
+                "to a valid cutlass3 include directory, or make sure the "
+                "3rdparty/cutlass3 submodule is in place "
+                f"(got {self.a_dtype} x {self.b_dtype} + {self.accum_dtype}, "
+                f"k_dim={k_dim}, ppu_arch={self.ppu_arch})"
+            )
+
+    def _use_m16n8_fallback(self, k_dim: int) -> bool:
+        """Whether the warp N slice must fall back to a native m16n8 atom.
+
+        Only the dtype combinations listed in _m16n8_fallback_dtype_supported
+        may use the m16n8 fallback, and only on PPU0015 (and newer) when the
+        warp N slice is a multiple of 8 but not of 16.  All other cases keep
+        requiring a warp N slice divisible by 16 (the m16n16 atoms).
+        """
+        return (
+            self.ppu_arch >= 15
+            and self.warp_col_tiles % 8 == 0
+            and self.warp_col_tiles % 16 != 0
+            and self._m16n8_fallback_dtype_supported(k_dim)
+        )
+
     def _initialize_micro_size(self, m_dim: int = 16, k_dim: int = 16):
         warp_row_tiles = self.warp_row_tiles
         warp_col_tiles = self.warp_col_tiles
         assert warp_row_tiles >= 16, f"warp_row_tiles must be >= 16, got {warp_row_tiles}"
         assert warp_row_tiles % 16 == 0, f"warp_row_tiles must be divisible by 16, got {warp_row_tiles}"
-        assert warp_col_tiles >= 16, f"warp_col_tiles must be >= 16, got {warp_col_tiles}"
-        assert warp_col_tiles % 16 == 0, f"warp_col_tiles must be divisible by 16, got {warp_col_tiles}"
+
+        if warp_col_tiles % 16 == 0:
+            assert warp_col_tiles >= 16, f"warp_col_tiles must be >= 16, got {warp_col_tiles}"
+            self.n_dim = 16
+            self.micro_size_y = 16
+            self.warp_cols = warp_col_tiles // 16
+        elif self._use_m16n8_fallback(k_dim):
+            # PPU0015 fallback: cover the warp N slice with native m16n8
+            # atoms (cute::SM80_16x8x16 / SM80_16x8x8 / SM80_16x8x32).
+            assert warp_col_tiles >= 8, f"warp_col_tiles must be >= 8, got {warp_col_tiles}"
+            self.n_dim = 8
+            self.micro_size_y = 8
+            self.warp_cols = warp_col_tiles // 8
+        else:
+            raise ValueError(
+                f"Unsupported warp_col_tiles {warp_col_tiles}: must be divisible by 16, "
+                "or by 8 for the PPU0015 m16n8 fallback "
+                "(fp16 x fp16 + fp32/fp16, bf16 x bf16 + fp32, tf32 x tf32 + fp32, "
+                "or int8 x int8 + int32); "
+                f"got {self.a_dtype} x {self.b_dtype} + {self.accum_dtype}"
+            )
         self.warp_rows = warp_row_tiles // m_dim
-        self.n_dim = 16
-        self.micro_size_y = 16
-        self.warp_cols = warp_col_tiles // 16
         self.micro_size_x = m_dim
         self.micro_size_k = k_dim
 
     def get_store_index_map(self, inverse: bool = False) -> IndexMap:
         warp_size, local_size_c = self.WARP_SIZE, self.local_size_out
-        store_layout = ppu_mma_store_32x8_to_shared_16x16_layout
-        if self.ppu_arch >= 15:
+        if self.n_dim == 8:
+            # m16n8 fallback C accumulator: 4 elements per lane of the accum
+            # dtype (fp16, fp32 or int32 — the SM80_16x8_Row CLayout
+            # geometry is dtype-independent).
+            store_layout = mma_store_32x4_to_shared_16x8_layout
+        elif self.ppu_arch >= 15:
             store_layout = mma_store_32x8_to_shared_16x16_layout
+        else:
+            store_layout = ppu_mma_store_32x8_to_shared_16x16_layout
         index_map = IndexMap.from_func(store_layout, index_dtype=T.int32)
         if not inverse:
             return index_map
@@ -1190,7 +1375,13 @@ class PPUTensorCoreIntrinEmitter(TensorCoreIntrinEmitter):
         self, B_local_buf: Buffer, B_shared_buf: Buffer | BufferRegion, ki: PrimExpr, rk: PrimExpr | None = 0, a_from_gemm_c: bool = False
     ):
         b_bits = DataType(self.b_dtype).bits
-        if b_bits not in (4, 8, 16):
+        if b_bits == 32 and self.n_dim == 8:
+            # m16n8k8 tf32 fallback: K-major tiles take the element-wise
+            # default loader (which picks the n8 forward map); N-major tiles
+            # fall through to the inline 32-bit ldmatrix.x2 branch below.
+            if not self.b_transposed:
+                return self._ldmatrix_b_default(B_local_buf, B_shared_buf, ki, rk)
+        elif b_bits not in (4, 8, 16):
             return self._ldmatrix_b_default(B_local_buf, B_shared_buf, ki, rk)
         if b_bits in (4, 8) and not self.b_transposed:
             return self._ldmatrix_b_default(B_local_buf, B_shared_buf, ki, rk)
@@ -1234,11 +1425,32 @@ class PPUTensorCoreIntrinEmitter(TensorCoreIntrinEmitter):
                 )
 
                 num = 4 if replicate_b else 2
-                access_extent = (2 * num) * (16 // b_bits)
+                # Bytes written per lane: num 32-bit registers expressed
+                # in dtype elements.  Equivalent to the previous
+                # (2*num)*(16//b_bits) for 4/8/16-bit and also correct for
+                # 32-bit (tf32).
+                access_extent = (num * 32) // b_bits
                 if b_bits == 4:
                     row_off, col_off = ldmatrix_32x16_to_shared_16x64_layout_b(tx, 0)
+                elif b_bits == 8 and self.n_dim == 8:
+                    # m16n8k32 fallback: ldmatrix.x2 loads the n8 x k32 B tile
+                    # as two 8x16 int8 matrices (SM80_16x8x32 B fragment,
+                    # N-major shared tile).
+                    row_off, col_off = ldmatrix_32x8_to_shared_8x32_layout_b(tx, 0)
                 elif b_bits == 8:
                     row_off, col_off = ldmatrix_32x16_to_shared_16x32_layout_b(tx, 0)
+                elif b_bits == 16 and self.n_dim == 8:
+                    # m16n8k16 fallback: ldmatrix.x2 loads the n8 x k16 B tile
+                    # as two 8x8 matrices (SM80_16x8x16 B fragment).
+                    if b_transposed:
+                        row_off, col_off = ldmatrix_32x4_to_shared_8x16_layout_b_fp16(tx, 0)
+                    else:
+                        row_off, col_off = ldmatrix_32x4_to_shared_16x8_layout_b_fp16(tx, 0)
+                elif b_bits == 32 and self.n_dim == 8:
+                    # m16n8k8 tf32 fallback: ldmatrix.x2 loads the n8 x k8 B
+                    # tile as two 8x8 fp32 matrices (SM80_16x8x8 B fragment,
+                    # N-major shared tile).
+                    row_off, col_off = ldmatrix_32x2_to_shared_8x8_layout_b_fp32(tx, 0)
                 elif self.ppu_arch >= 15 and not b_transposed:
                     row_off, col_off = ldmatrix_32x8_to_shared_16x16_layout(tx, 0)
                 else:
@@ -1496,7 +1708,8 @@ class PPUTensorCoreIntrinEmitter(TensorCoreIntrinEmitter):
         accum_dtype = self.accum_dtype
         accum_dtype_abbrv = self.accum_dtype_abbrv
         mma_prefix = self.mma_prefix
-        # PPU uses m16n16 instructions, so B does not need replication.
+        # PPU m16n16/m16n8 atoms are native, so B never needs the CUDA-style
+        # replicate_b double-issue; local sizes already follow n_dim.
 
         a_is_fragment = is_fragment(A_local_buf)
         b_is_fragment = is_fragment(B_local_buf)

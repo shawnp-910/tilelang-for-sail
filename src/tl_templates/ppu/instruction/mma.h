@@ -6,6 +6,13 @@
 #include <cute/arch/mma_ppu0010.hpp>
 #elif __HGGC_ARCH__ == 150
 #include <cute/arch/mma_ppu0015.hpp>
+#ifdef TL_PPU_HAS_CUTLASS3
+// CUTLASS3 cute atoms cover MMA fallback shapes that actlize does not
+// provide for PPU0015 (e.g. m16n8k16). mma_traits_sm80.hpp pulls in
+// cute/arch/mma_sm80.hpp, and CUTE_ARCH_MMA_SM80_ENABLED (defined by the
+// hgcc driver) gates its fma bodies on the real PTX path.
+#include <cute/atom/mma_traits_sm80.hpp>
+#endif
 #endif
 
 namespace tl {
@@ -82,6 +89,26 @@ TL_PPU_DEFINE_MMA_DISPATCHER(kFloat8_e5m2, kFloat8_e5m2, kFloat32, 16, 16, 32,
                              cute::PPU0015_16x16x32_F32E5M2E5M2F32_TN)
 TL_PPU_DEFINE_MMA_DISPATCHER(kInt8, kInt8, kInt32, 16, 16, 32, false, true,
                              false, cute::PPU0015_16x16x32_S32S8S8S32_TN)
+
+#ifdef TL_PPU_HAS_CUTLASS3
+// 16x8 MMA fallback: reuse the CUTLASS3 cute SM80 atoms (which hgcc lowers
+// to the same m16n8k* tensor-core instruction family) for the N=8 shapes
+// that actlize does not expose for PPU0015. TransA/TransB follow the existing
+// F32F16F16F32 TN entry above (TransA=false, TransB=true).
+TL_PPU_DEFINE_MMA_DISPATCHER(kFloat16, kFloat16, kFloat32, 16, 8, 16, false,
+                             true, false, cute::SM80_16x8x16_F32F16F16F32_TN)
+// F16 accumulate: the atom packs the four f16 outputs into 2 b32 registers
+// (D/C both uint32_t[2]), so the DReg == CReg assertion still holds.
+TL_PPU_DEFINE_MMA_DISPATCHER(kFloat16, kFloat16, kFloat16, 16, 8, 16, false,
+                             true, false, cute::SM80_16x8x16_F16F16F16F16_TN)
+TL_PPU_DEFINE_MMA_DISPATCHER(kBFloat16, kBFloat16, kFloat32, 16, 8, 16, false,
+                             true, false, cute::SM80_16x8x16_F32BF16BF16F32_TN)
+TL_PPU_DEFINE_MMA_DISPATCHER(kTensorFloat32, kTensorFloat32, kFloat32, 16, 8,
+                             8, false, true, false,
+                             cute::SM80_16x8x8_F32TF32TF32F32_TN)
+TL_PPU_DEFINE_MMA_DISPATCHER(kInt8, kInt8, kInt32, 16, 8, 32, false, true,
+                             false, cute::SM80_16x8x32_S32S8S8S32_TN)
+#endif
 
 // FP4 e2m1 MMA: the atom carries 4 extra E8M0 scale registers (SRegisters),
 // so it cannot use TL_PPU_DEFINE_MMA_DISPATCHER (call_fma only unpacks

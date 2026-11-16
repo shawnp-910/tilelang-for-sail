@@ -21,6 +21,8 @@ CUTLASS_NOT_FOUND_MESSAGE = "CUTLASS is not installed or found in the expected p
 ", which may lead to compilation bugs when utilize tilelang backend."
 ACTLIZE_NOT_FOUND_MESSAGE = "actlize is not installed or found in the expected path"
 ", which may lead to compilation bugs when utilize tilelang PPU backend."
+CUTLASS3_NOT_FOUND_MESSAGE = "cutlass3 is not installed or found in the expected path"
+", which may lead to compilation bugs when utilize tilelang PPU backend m16n8k16 fallback."
 COMPOSABLE_KERNEL_NOT_FOUND_MESSAGE = "Composable Kernel is not installed or found in the expected path"
 ", which may lead to compilation bugs when utilize tilelang backend."
 TL_TEMPLATE_NOT_FOUND_MESSAGE = "TileLang is not installed or found in the expected path"
@@ -330,6 +332,7 @@ class Environment:
     CUTLASS_INCLUDE_DIR = EnvVar("TL_CUTLASS_PATH", None)
     COMPOSABLE_KERNEL_INCLUDE_DIR = EnvVar("TL_COMPOSABLE_KERNEL_PATH", None)
     ACTLIZE_INCLUDE_DIR = EnvVar("TL_ACTLIZE_PATH", None)
+    CUTLASS3_INCLUDE_DIR = EnvVar("TL_CUTLASS3_PATH", None)
 
     # TVM integration
     TVM_PYTHON_PATH = EnvVar("TVM_IMPORT_PYTHON_PATH", None)
@@ -580,6 +583,15 @@ if os.environ.get("TL_ACTLIZE_PATH", None) is None:
     else:
         logger.warning(ACTLIZE_NOT_FOUND_MESSAGE)
 
+# Initialize cutlass3 (CUTLASS 3.x cute atoms, e.g. the SM80 16x8x16 MMA
+# fallback shapes that actlize does not provide for the PPU backend)
+if os.environ.get("TL_CUTLASS3_PATH", None) is None:
+    cutlass3_inc_path = os.path.join(THIRD_PARTY_ROOT, "cutlass3", "include")
+    if os.path.exists(cutlass3_inc_path):
+        os.environ["TL_CUTLASS3_PATH"] = env.CUTLASS3_INCLUDE_DIR = cutlass3_inc_path
+    else:
+        logger.warning(CUTLASS3_NOT_FOUND_MESSAGE)
+
 # Initialize TL_TEMPLATE_PATH
 if os.environ.get("TL_TEMPLATE_PATH", None) is None:
     tl_template_path = os.path.join(THIRD_PARTY_ROOT, "..", "src")
@@ -592,5 +604,6 @@ if os.environ.get("TL_TEMPLATE_PATH", None) is None:
 CUTLASS_INCLUDE_DIR = env.CUTLASS_INCLUDE_DIR
 COMPOSABLE_KERNEL_INCLUDE_DIR = env.COMPOSABLE_KERNEL_INCLUDE_DIR
 ACTLIZE_INCLUDE_DIR = env.ACTLIZE_INCLUDE_DIR
+CUTLASS3_INCLUDE_DIR = env.CUTLASS3_INCLUDE_DIR
 TILELANG_TEMPLATE_PATH = env.TILELANG_TEMPLATE_PATH
 TILELANG_HIP_SAVE_TEMP_FILES = env.TILELANG_HIP_SAVE_TEMP_FILES
