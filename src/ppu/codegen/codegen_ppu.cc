@@ -599,7 +599,7 @@ public:
 };
 
 // PPU: detect whether the kernel uses Actlize MMA instructions
-// (m16n16k* or the cutlass3-backed m16n8k16 fallback).
+// (m16n16k* or the m16n8k* fallback)
 class ActlizeDetector : public tirx::StmtExprVisitor {
 public:
   bool use_actlize_{false};
@@ -5115,12 +5115,10 @@ void CodeGenTileLangPPU::AddFunction(const GlobalVar &gvar, const PrimFunc &f) {
   // Record cluster dimensions for usage in threadblock swizzle codegen
   this->cluster_dims = ClusterInfoExtractor().extract(f);
 
-  // Detect whether Actlize MMA (m16n16k* or the cutlass3-backed m16n8k16
-  // fallback) is used, which requires the PPU-specific ldmatrix layout.
-  // Note: the PPU-specific ldmatrix path below only rewrites x4 transposed
-  // loads, i.e. the 4-register B fragment of an n == 16 MMA. An n == 8 MMA
-  // carries a 2-register B fragment (x2 loads), so it never selects the
-  // _ppu variant; no shape-specific handling is needed here.
+  // Detect whether Actlize MMA (m16n16k* or the m16n8k* fallback) is
+  // used, which requires the PPU-specific ldmatrix layout. The ldmatrix path
+  // only rewrites x4 transposed loads (the n == 16 B fragment); n == 8 uses
+  // x2 loads and never selects the _ppu variant.
   ActlizeDetector actlize_detector;
   actlize_detector.detect(f);
   use_actlize_ldmatrix_ = actlize_detector.use_actlize_;

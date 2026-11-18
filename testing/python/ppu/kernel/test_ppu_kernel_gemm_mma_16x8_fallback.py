@@ -5,7 +5,8 @@ On PPU0015, ``tilelang/ppu/intrinsics/macro/mma_macro_generator.py``
 (``PPUTensorCoreIntrinEmitter::_initialize_micro_size``) originally asserted
 ``warp_col_tiles % 16 == 0`` and raised for N slices such as 8 or 24.
 
-The fallback selects the MMA atom (cutlass3 SM80 atoms) by the warp N slice:
+The fallback selects the MMA atom (actlize-native PPU0015 m16n8 atoms) by
+the warp N slice:
 - ``warp_col_tiles % 16 == 0`` -> m16n16k* atoms (no fallback)
 - ``warp_col_tiles % 8 == 0``  -> m16n8* atoms:
   - fp16 x fp16 (fp16 or fp32 accum): m16n8k16
@@ -20,11 +21,9 @@ accumulation, fp8 k16 (unreachable: the fp8 k_dim is always 32), uint8
 mixes and fp4 are not covered here. PPU0010 does not support the fallback
 (it errors out on n8 tiles directly), so no PPU0010 cases are included.
 
-All cases must match the torch reference once the fallback is implemented.
-They fail on the pre-fallback code, which is exactly the purpose of this
-repro. ``warp_col_tiles = block_N // n_warp``; with block_M = 32 and the
-default Square warp policy all cases below get n_warp = 1, so
-warp_col_tiles equals block_N.
+All cases must match the torch reference. ``warp_col_tiles = block_N //
+n_warp``; with block_M = 32 and the default Square warp policy all cases
+below get n_warp = 1, so warp_col_tiles equals block_N.
 """
 
 import tilelang

@@ -50,15 +50,11 @@ ComputeDefaultWarpPartition(const GemmWarpPolicyNode &policy, int M, int N,
   ICHECK(N % k_n_per_warp == 0)
       << "N must be divisible by " << k_n_per_warp << ", but got " << N;
 
-  // n_warp must both divide N and leave each warp a whole number of
-  // k_n_per_warp-wide MMA tiles along N, i.e. warp_col_tiles = N / n_warp must
-  // stay an integer multiple of k_n_per_warp. Otherwise the per-warp tile
-  // cannot be sliced into MMA instructions (e.g. N = 24 with n_warp = 2 gives
-  // warp_col_tiles = 12, which fits neither 16-wide nor 8-wide MMA tiles; and
-  // N = 136 with n_warp = 16 covers only 128 columns because 16 does not divide
-  // 136). N % (n * k_n_per_warp) == 0 states exactly "n divides N and
-  // (N / n) % k_n_per_warp == 0"; unlike the truncating (N / n) %
-  // k_n_per_warp == 0 form it cannot accept an n that leaves N % n != 0.
+  // N % (n * k_n_per_warp) == 0: n_warp divides N and warp_col_tiles stays
+  // a multiple of k_n_per_warp, so each warp covers whole MMA tile columns.
+  // The old partition emitted non-multiple-of-16 warp_col_tiles and failed
+  // at the Python divisibility assertion; such candidates are now skipped
+  // here.
   auto valid_n_warp = [N, k_n_per_warp](int n) {
     return N % (n * k_n_per_warp) == 0;
   };
@@ -168,15 +164,9 @@ struct Gemm {
                        int block_size, Target target, String gemm_inst) {
     int num_warps = block_size / TargetPPUGetWarpSize(target);
     // PPU MMA uses m16n16 tiles, so each warp needs at least 16 columns.
-    // Shapes with N only divisible by 8 (e.g. block_N = 8/24 lowered to the
-    // cutlass3-backed m16n8k16 MMA fallback) need just 8 columns per warp,
-    // so relax kNPerWarp to 8 for them. N % 16 == 0 keeps the historical
-    // kNPerWarp = 16 partition behavior bit-identical.
-    // tl.ppu_force_gemm_n8 (written by the LayoutInference compatibility
-    // retry) additionally forces the 8-wide partition for N % 16 == 0; then
-    // N % 8 == 0 is the only divisibility requirement (N % 16 == 0 implies
-    // it), and valid_n_warp's N % (n * k_n_per_warp) == 0 predicate still
-    // guarantees whole m16n8 tiles per warp.
+    // N divisible only by 8 (m16n8k* fallback shapes) or the retry-set
+    // tl.ppu_force_gemm_n8 config relaxes kNPerWarp to 8; otherwise keep 16
+    // to preserve the historical partition.
     bool force_gemm_n8 = tvm::transform::PassContext::Current()
                              ->GetConfig<Bool>(kPpuForceGemmN8, Bool(false))
                              .value();
