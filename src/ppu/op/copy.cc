@@ -317,8 +317,9 @@ bool HasAlignedPPUAsyncCopyTransactions(const Buffer &logical_buffer,
   int64_t transaction_count = *extent / transaction_elements;
   int64_t outer_rows = 1;
   for (size_t i = 0; i + 1 < active_axes.size(); ++i) {
-    const int64_t *outer_extent =
-        as_const_int(analyzer->Simplify(ranges[active_axes[i]]->extent));
+    PrimExpr simplified_outer_extent =
+        analyzer->Simplify(ranges[active_axes[i]]->extent);
+    const int64_t *outer_extent = as_const_int(simplified_outer_extent);
     if (outer_extent == nullptr || *outer_extent <= 0) {
       return false;
     }
@@ -371,11 +372,10 @@ bool RequiresSynchronousPPUSubwordCopy(const CopyNode &op,
   // async-main/synchronous-tail lowering regressed all measured ragged cases,
   // so an unaligned or non-divisible copy keeps the established synchronous
   // lowering instead of being peeled.
-  bool src_aligned = HasAlignedPPUAsyncCopyTransactions(
-      op.src, op.src_range, plan.min_width, buffer_remap, layout_map, analyzer);
-  bool dst_aligned = HasAlignedPPUAsyncCopyTransactions(
-      op.dst, op.dst_range, plan.min_width, buffer_remap, layout_map, analyzer);
-  if (!src_aligned || !dst_aligned) {
+  if (!HasAlignedPPUAsyncCopyTransactions(op.src, op.src_range, plan.min_width,
+                                          buffer_remap, layout_map, analyzer) ||
+      !HasAlignedPPUAsyncCopyTransactions(op.dst, op.dst_range, plan.min_width,
+                                          buffer_remap, layout_map, analyzer)) {
     return true;
   }
   return false;
