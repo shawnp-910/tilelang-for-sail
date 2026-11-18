@@ -129,6 +129,28 @@ class PassConfigKey(str, Enum):
     TL_DISABLE_LDMAT_SWZL = "tl.disable_ldmat_swzl"
     """Disable PPU1.5 ldmatrix swizzled bulk tensor load lowering. Default: False"""
 
+    TL_PPU_ENABLE_N8_COMPAT = "tl.ppu_enable_n8_compat"
+    """Enable the PPU layout-inference m16n8 compatibility retry. Default: True
+
+    When enabled (default), the PPU LayoutInference pass catches layout
+    conflicts (LayoutConflictException or other failures during layout
+    collection) and retries once with ``tl.ppu_force_gemm_n8`` flipped to
+    True, which forces gemm warp partitions onto the m16n8 fallback atoms
+    even when the warp N slice is divisible by 16. The retry may reduce
+    performance. Set to False to restore the strict fail-fast behavior.
+    """
+
+    TL_PPU_FORCE_GEMM_N8 = "tl.ppu_force_gemm_n8"
+    """Force gemm warp partitions onto the m16n8 fallback atoms. Default: False
+
+    When True, the gemm warp partition uses kNPerWarp = 8 (instead of 16
+    whenever N % 16 == 0) and the MMA emitter selects m16n8 atoms even for
+    warp N slices divisible by 16. This is normally written by the PPU
+    LayoutInference pass during the ``tl.ppu_enable_n8_compat`` retry; it can
+    also be set manually to reproduce the fallback code path for N % 16 == 0
+    shapes.
+    """
+
     TL_ENABLE_LOWER_LDGSTG = "tl.enable_lower_ldgstg"
     """Enable non-predicated LDG/STG lowering for global memory access.
     When enabled, converts Ramp-based global buffer load/store to ldg/stg intrinsics.

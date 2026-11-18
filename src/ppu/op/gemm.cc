@@ -5,6 +5,7 @@
 
 #include "op/gemm.h"
 #include "support/check.h"
+#include <tvm/ir/transform.h>
 #include <tvm/runtime/logging.h>
 
 #include "op/builtin.h"
@@ -171,7 +172,15 @@ struct Gemm {
     // cutlass3-backed m16n8k16 MMA fallback) need just 8 columns per warp,
     // so relax kNPerWarp to 8 for them. N % 16 == 0 keeps the historical
     // kNPerWarp = 16 partition behavior bit-identical.
-    const int kNPerWarp = (N % 16 == 0) ? 16 : 8;
+    // tl.ppu_force_gemm_n8 (written by the LayoutInference compatibility
+    // retry) additionally forces the 8-wide partition for N % 16 == 0; then
+    // N % 8 == 0 is the only divisibility requirement (N % 16 == 0 implies
+    // it), and valid_n_warp's N % (n * k_n_per_warp) == 0 predicate still
+    // guarantees whole m16n8 tiles per warp.
+    bool force_gemm_n8 = tvm::transform::PassContext::Current()
+                             ->GetConfig<Bool>(kPpuForceGemmN8, Bool(false))
+                             .value();
+    const int kNPerWarp = (force_gemm_n8 || N % 16 != 0) ? 8 : 16;
     return ComputeDefaultWarpPartition(policy, M, N, num_warps, kNPerWarp);
   }
 

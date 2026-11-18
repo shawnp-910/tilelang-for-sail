@@ -12,10 +12,13 @@ The fallback selects the MMA atom (cutlass3 SM80 atoms) by the warp N slice:
   - bf16 x bf16 (fp32 accum):          m16n8k16
   - tf32 x tf32 (fp32 accum):          m16n8k8
   - int8 x int8 (int32 accum):         m16n8k32
+  - fp8 x fp8 over the e4m3/e5m2 operand mixes, A != B included
+    (fp32 accum):                       m16n8k32
 
-Plain fp32/fp8/fp4 cases keep the 16x16 atoms (no fallback) and are not
-covered here. PPU0010 does not support the fallback (it errors out on n8
-tiles directly), so no PPU0010 cases are included.
+Plain fp32 and fp4 cases keep the 16x16 atoms (no fallback). fp8 with fp16
+accumulation, fp8 k16 (unreachable: the fp8 k_dim is always 32), uint8
+mixes and fp4 are not covered here. PPU0010 does not support the fallback
+(it errors out on n8 tiles directly), so no PPU0010 cases are included.
 
 All cases must match the torch reference once the fallback is implemented.
 They fail on the pre-fallback code, which is exactly the purpose of this
@@ -27,6 +30,26 @@ warp_col_tiles equals block_N.
 import tilelang
 import tilelang.testing
 import tilelang.language as T
+
+
+def _is_fp8_dtype(dtype) -> bool:
+    return "float8" in str(dtype)
+
+
+def _gen_fp8_inputs(A_shape, B_shape, in_dtype, b_in_dtype):
+    """Generate finite fp8 inputs: sample in fp16 first, then cast, so that
+    the default random-bit supply does not produce NaN/Inf bit patterns.
+
+    A and B are cast separately so mixed combos (e.g. e4m3 A x e5m2 B) do
+    not share one cast."""
+    import torch
+
+    from tilelang.utils.device import get_current_device
+
+    device = get_current_device()
+    A = torch.randn(*A_shape, dtype=torch.float16, device=device).to(in_dtype.as_torch())
+    B = torch.randn(*B_shape, dtype=torch.float16, device=device).to(b_in_dtype.as_torch())
+    return [A, B]
 
 
 def matmul(
@@ -41,16 +64,20 @@ def matmul(
     accum_dtype,
     num_stages,
     threads,
+    b_in_dtype=None,
 ):
+    if b_in_dtype is None:
+        b_in_dtype = in_dtype
+
     @T.prim_func
     def main(
         A: T.Tensor((M, K), in_dtype),
-        B: T.Tensor((K, N), in_dtype),
+        B: T.Tensor((K, N), b_in_dtype),
         C: T.Tensor((M, N), out_dtype),
     ):
         with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=threads) as (bx, by):
             A_shared = T.alloc_shared((block_M, block_K), in_dtype)
-            B_shared = T.alloc_shared((block_K, block_N), in_dtype)
+            B_shared = T.alloc_shared((block_K, block_N), b_in_dtype)
             C_local = T.alloc_fragment((block_M, block_N), accum_dtype)
             T.clear(C_local)
             for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=num_stages):
@@ -74,6 +101,7 @@ def run_gemm(
     accum_dtype,
     num_stages=0,
     num_threads=128,
+    b_in_dtype=None,
 ):
     program = matmul(
         M,
@@ -87,6 +115,7 @@ def run_gemm(
         accum_dtype,
         num_stages,
         num_threads,
+        b_in_dtype,
     )
 
     kernel = tilelang.compile(program, out_idx=[2])
@@ -104,7 +133,14 @@ def run_gemm(
         C = C.to(torch.__getattribute__(out_dtype))
         return C
 
-    profiler.assert_allclose(ref_program, atol=1e-2, rtol=1e-2)
+    _b = b_in_dtype if b_in_dtype is not None else in_dtype
+    if _is_fp8_dtype(in_dtype) or _is_fp8_dtype(_b):
+        # fp8 tolerance follows the main-path fp8 gemm cases
+        # (testing/python/ppu/kernel/test_ppu_kernel_gemm.py).
+        ins = _gen_fp8_inputs((M, K), (K, N), in_dtype, _b)
+        profiler.assert_allclose(ref_program, input_tensors=ins, atol=1e-2, rtol=1e-2)
+    else:
+        profiler.assert_allclose(ref_program, atol=1e-2, rtol=1e-2)
 
 
 # ---------------------------------------------------------------------------
@@ -322,6 +358,172 @@ def test_ppu_gemm_mma_16x8_fallback_i8i8i32_n24():
         T.int8,
         T.int32,
         T.int32,
+        0,
+        128,
+    )
+
+
+# ---------------------------------------------------------------------------
+# fp8 x fp8 (e4m3/e5m2 mixes), fp32 accumulation (m16n8k32)
+# ---------------------------------------------------------------------------
+
+
+@tilelang.testing.requires_ppu
+@tilelang.testing.requires_ppu_compute_version_ge(1, 5)
+def test_ppu_gemm_mma_16x8_fallback_e4m3e4m3f32_n8():
+    # warp_col_tiles = 8 -> m16n8k32 fp8 atom (fp8 k_dim = 32, block_K = 32
+    # is exactly one k slice).
+    run_gemm(
+        128,
+        64,
+        128,
+        32,
+        8,
+        32,
+        T.float8_e4m3fn,
+        T.float32,
+        T.float32,
+        0,
+        128,
+    )
+
+
+@tilelang.testing.requires_ppu
+@tilelang.testing.requires_ppu_compute_version_ge(1, 5)
+def test_ppu_gemm_mma_16x8_fallback_e4m3e4m3f32_n24():
+    # warp_col_tiles = 24 (16 + 8 mixed) -> m16n8k32 fp8 atom.
+    run_gemm(
+        128,
+        48,
+        128,
+        32,
+        24,
+        32,
+        T.float8_e4m3fn,
+        T.float32,
+        T.float32,
+        0,
+        128,
+    )
+
+
+@tilelang.testing.requires_ppu
+@tilelang.testing.requires_ppu_compute_version_ge(1, 5)
+def test_ppu_gemm_mma_16x8_fallback_e4m3e5m2f32_n8():
+    # warp_col_tiles = 8 -> m16n8k32 fp8 atom with mixed operands: e4m3 A
+    # x e5m2 B (A and B are cast separately in _gen_fp8_inputs).
+    run_gemm(
+        128,
+        64,
+        128,
+        32,
+        8,
+        32,
+        T.float8_e4m3fn,
+        T.float32,
+        T.float32,
+        0,
+        128,
+        b_in_dtype=T.float8_e5m2,
+    )
+
+
+@tilelang.testing.requires_ppu
+@tilelang.testing.requires_ppu_compute_version_ge(1, 5)
+def test_ppu_gemm_mma_16x8_fallback_e4m3e5m2f32_n24():
+    # warp_col_tiles = 24 (16 + 8 mixed) -> m16n8k32 fp8 atom, e4m3 A x
+    # e5m2 B.
+    run_gemm(
+        128,
+        48,
+        128,
+        32,
+        24,
+        32,
+        T.float8_e4m3fn,
+        T.float32,
+        T.float32,
+        0,
+        128,
+        b_in_dtype=T.float8_e5m2,
+    )
+
+
+@tilelang.testing.requires_ppu
+@tilelang.testing.requires_ppu_compute_version_ge(1, 5)
+def test_ppu_gemm_mma_16x8_fallback_e5m2e4m3f32_n8():
+    # warp_col_tiles = 8 -> m16n8k32 fp8 atom, e5m2 A x e4m3 B.
+    run_gemm(
+        128,
+        64,
+        128,
+        32,
+        8,
+        32,
+        T.float8_e5m2,
+        T.float32,
+        T.float32,
+        0,
+        128,
+        b_in_dtype=T.float8_e4m3fn,
+    )
+
+
+@tilelang.testing.requires_ppu
+@tilelang.testing.requires_ppu_compute_version_ge(1, 5)
+def test_ppu_gemm_mma_16x8_fallback_e5m2e4m3f32_n24():
+    # warp_col_tiles = 24 (16 + 8 mixed) -> m16n8k32 fp8 atom, e5m2 A x
+    # e4m3 B.
+    run_gemm(
+        128,
+        48,
+        128,
+        32,
+        24,
+        32,
+        T.float8_e5m2,
+        T.float32,
+        T.float32,
+        0,
+        128,
+        b_in_dtype=T.float8_e4m3fn,
+    )
+
+
+@tilelang.testing.requires_ppu
+@tilelang.testing.requires_ppu_compute_version_ge(1, 5)
+def test_ppu_gemm_mma_16x8_fallback_e5m2e5m2f32_n8():
+    # warp_col_tiles = 8 -> m16n8k32 fp8 atom with e5m2 operands.
+    run_gemm(
+        128,
+        64,
+        128,
+        32,
+        8,
+        32,
+        T.float8_e5m2,
+        T.float32,
+        T.float32,
+        0,
+        128,
+    )
+
+
+@tilelang.testing.requires_ppu
+@tilelang.testing.requires_ppu_compute_version_ge(1, 5)
+def test_ppu_gemm_mma_16x8_fallback_e5m2e5m2f32_n24():
+    # warp_col_tiles = 24 (16 + 8 mixed) -> m16n8k32 fp8 atom with e5m2
+    # operands.
+    run_gemm(
+        128,
+        48,
+        128,
+        32,
+        24,
+        32,
+        T.float8_e5m2,
+        T.float32,
+        T.float32,
         0,
         128,
     )

@@ -114,6 +114,14 @@ static constexpr const char *kPtxasRegisterUsageLevel =
 static constexpr const char *kDisableVectorize256 = "tl.disable_vectorize_256";
 static constexpr const char *kEnableAsyncCopy = "tl.enable_async_copy";
 static constexpr const char *kDisableLdmatSwzl = "tl.disable_ldmat_swzl";
+// PPU: total switch for the LayoutInference m16n8 compatibility retry. When
+// true (default), tl.ppu.transform.LayoutInference catches layout conflicts
+// and retries layout collection once with kPpuForceGemmN8 flipped to true.
+static constexpr const char *kPpuEnableN8Compat = "tl.ppu_enable_n8_compat";
+// PPU: force gemm warp partitions onto the m16n8 fallback atoms even when
+// the warp N slice is divisible by 16. Written by the LayoutInference retry
+// above; can also be set manually to reproduce the fallback code path.
+static constexpr const char *kPpuForceGemmN8 = "tl.ppu_force_gemm_n8";
 static constexpr const char *kEnableVectorizePlannerVerbose =
     "tl.enable_vectorize_planner_verbose";
 static constexpr const char *kDisableWGMMA = "tl.disable_wgmma";

@@ -14,6 +14,7 @@
 
 #include "support/check.h"
 #include <tvm/ir/cast.h>
+#include <tvm/ir/transform.h>
 #include <tvm/runtime/logging.h>
 #include <tvm/s_tir/utils.h>
 #include <tvm/tirx/builtin.h>
@@ -1246,15 +1247,64 @@ private:
   Map<ObjectRef, Map<Buffer, Buffer>> trans_buffer_;
 };
 
+/*!
+ * \brief Retry layout collection once with the gemm m16n8 compatibility mode.
+ *
+ * Mirrors the v0.1.8 LayoutInference compatibility fallback: after a layout
+ * conflict (or any other collection failure), flip the tl.ppu_force_gemm_n8
+ * pass config so gemm warp partitions and the Python MMA emitter both select
+ * the m16n8 atoms, then re-collect the layouts. The flipped config stays in
+ * the shared PassContext until the compilation finishes, so the Lower stage
+ * re-runs the same decisions. A second failure escapes unchanged so callers
+ * still see the original retry error; only one retry is attempted.
+ */
+template <typename RunCollect>
+void RetryCollectWithN8Compat(tvm::transform::PassContext pass_ctx,
+                              const std::string &first_error,
+                              RunCollect &&runCollect) {
+  LOG(WARNING)
+      << "PPU layout inference failed with: " << first_error
+      << ". Retrying once with the gemm m16n8 compatibility fallback "
+         "(tl.ppu_force_gemm_n8 = true); this may result in a performance drop.";
+  pass_ctx->config.Set(kPpuForceGemmN8, Bool(true));
+  try {
+    runCollect();
+  } catch (const std::exception &retry_error) {
+    LOG(WARNING) << "PPU layout inference still fails after the m16n8 "
+                    "compatibility retry: "
+                 << retry_error.what();
+    throw;
+  }
+}
+
 class LayoutInferencer : public IRMutatorWithAnalyzer {
 public:
   static PrimFunc Substitute(PrimFunc f, bool skip_thread_partition = false) {
     arith::Analyzer analyzer;
     PrimFuncNode *fptr = f.CopyOnWrite();
     fptr->body = ParallelLoopFuser::Fuse(f->body);
-    BufferUseDefCollector collector(skip_thread_partition);
-    collector.Collect(f);
-    auto result = collector.Run();
+    LayoutInferenceResult result;
+
+    auto runCollect = [&]() {
+      BufferUseDefCollector collector(skip_thread_partition);
+      collector.Collect(f);
+      result = collector.Run();
+    };
+
+    tvm::transform::PassContext pass_ctx = tvm::transform::PassContext::Current();
+    bool ppu_enable_n8_compat =
+        pass_ctx->GetConfig<Bool>(kPpuEnableN8Compat, Bool(true)).value();
+    if (ppu_enable_n8_compat) {
+      try {
+        runCollect();
+      } catch (const LayoutConflictException &e) {
+        RetryCollectWithN8Compat(pass_ctx, e.what(), runCollect);
+      } catch (const std::exception &e) {
+        RetryCollectWithN8Compat(pass_ctx, e.what(), runCollect);
+      }
+    } else {
+      runCollect();
+    }
     LayoutInferencer substituter(result, &analyzer);
     fptr->body = substituter.VisitStmt(f->body);
     return f;
