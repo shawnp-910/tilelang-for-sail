@@ -274,8 +274,8 @@ bool HasAlignedPPUAsyncCopyTransactions(const Buffer &logical_buffer,
   // Here, prove the complementary condition that every transaction begins on
   // a four-byte boundary after the final layout remap.
   auto indices_are_aligned = [&](const Array<PrimExpr> &indices) {
-    auto physical_offset =
-        LinearOffsetOfIndices(logical_buffer, indices, buffer_remap, layout_map);
+    auto physical_offset = LinearOffsetOfIndices(logical_buffer, indices,
+                                                 buffer_remap, layout_map);
     if (!physical_offset.has_value()) {
       return false;
     }
@@ -299,10 +299,9 @@ bool HasAlignedPPUAsyncCopyTransactions(const Buffer &logical_buffer,
     Array<PrimExpr> indices = base_indices;
     for (size_t i = 0; i + 1 < active_axes.size(); ++i) {
       size_t axis = active_axes[i];
-      indices.Set(axis,
-                  ranges[axis]->min +
-                      Var("ppu_async_copy_outer_" + std::to_string(axis),
-                          ranges[axis]->min.dtype()));
+      indices.Set(axis, ranges[axis]->min +
+                            Var("ppu_async_copy_outer_" + std::to_string(axis),
+                                ranges[axis]->min.dtype()));
     }
     if (indices_are_aligned(with_inner_delta(indices, symbolic_inner_delta))) {
       return true;
@@ -336,8 +335,8 @@ bool HasAlignedPPUAsyncCopyTransactions(const Buffer &logical_buffer,
       int64_t outer_extent =
           *as_const_int(analyzer->Simplify(ranges[axis]->extent));
       indices.Set(axis,
-                  ranges[axis]->min +
-                      make_const(ranges[axis]->min.dtype(), rem % outer_extent));
+                  ranges[axis]->min + make_const(ranges[axis]->min.dtype(),
+                                                 rem % outer_extent));
       rem /= outer_extent;
     }
     if (indices_are_aligned(with_inner_delta(indices, symbolic_inner_delta))) {
