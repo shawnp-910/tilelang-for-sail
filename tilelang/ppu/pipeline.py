@@ -20,6 +20,7 @@ from tilelang.contrib.hgcc import (
     have_mbarrier,
     have_pdl,
 )
+from tilelang.ppu.gdn_scan import schedule_verified_scan
 
 
 def _module_has_shared_barrier(mod: IRModule) -> bool:
@@ -65,6 +66,7 @@ def _AlignAIUSharedMemory(func, mod, ctx):
 
 
 def PPUPassPipelineBodyPrologue(mod: IRModule, target: Target) -> IRModule:
+    mod = schedule_verified_scan(mod, target)
     mod = tirx.transform.BindTarget(target)(mod)
     mod = tilelang.transform.MaterializeKernelLaunch(lower_thread_binding=True, default_threads=128)(mod)
     if should_force_let_inline():
