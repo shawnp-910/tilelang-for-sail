@@ -121,7 +121,7 @@ ComputeDefaultWarpPartition(const GemmWarpPolicyNode &policy, int M, int N,
         continue;
       if (m * n != num_warps)
         continue;
-      if (!valid_n_warp(n))
+      if (!valid_n_warp(n) || M % (m * kMPerWarp) != 0)
         continue;
 
       float balance = std::abs(m_per_warp / n_per_warp - ideal_ratio);
