@@ -99,6 +99,10 @@ ComputeDefaultWarpPartition(const GemmWarpPolicyNode &policy, int M, int N,
       if (m != 0) {
         best_m = m;
       }
+      // Shrink m_warp until every warp covers whole MMA tiles.
+      while (best_m > 1 && M % (best_m * kMPerWarp) != 0) {
+        --best_m;
+      }
     } else {
       best_m = max_m_warp;
       best_n = max_n_warp;
@@ -163,10 +167,8 @@ struct Gemm {
   ComputeWarpPartition(const GemmWarpPolicyNode &policy, int M, int N,
                        int block_size, Target target, String gemm_inst) {
     int num_warps = block_size / TargetPPUGetWarpSize(target);
-    // PPU MMA uses m16n16 tiles, so each warp needs at least 16 columns.
-    // On PPU0015+, N divisible only by 8 (m16n8k* fallback shapes) or the
-    // retry-set tl.ppu_force_gemm_n8 config relaxes kNPerWarp to 8. The
-    // m16n8 atoms do not exist on PPU0010, which keeps kNPerWarp = 16.
+    // PPU MMA tiles need a 16-column warp slice; PPU0015+ relaxes it to 8
+    // for m16n8k* fallback shapes or when tl.ppu_force_gemm_n8 is set.
     int k_n_per_warp = 16;
     if (GetPPUArchInt(target) >= 15) {
       bool force_gemm_n8 = tvm::transform::PassContext::Current()
