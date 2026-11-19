@@ -1292,7 +1292,13 @@ public:
         tvm::transform::PassContext::Current();
     bool ppu_enable_n8_compat =
         pass_ctx->GetConfig<Bool>(kPpuEnableN8Compat, Bool(true)).value();
-    if (ppu_enable_n8_compat) {
+    // The m16n8 fallback requires PPU0015+ atoms; PPU0010 stays fail-fast
+    // so the original error propagates unchanged.
+    int ppu_arch = 0;
+    if (auto target = f->GetAttr<Target>(tvm::attr::kTarget)) {
+      ppu_arch = GetPPUArchInt(target.value());
+    }
+    if (ppu_enable_n8_compat && ppu_arch >= 15) {
       try {
         runCollect();
       } catch (const LayoutConflictException &e) {

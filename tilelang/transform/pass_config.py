@@ -138,6 +138,9 @@ class PassConfigKey(str, Enum):
     True, which forces gemm warp partitions onto the m16n8 fallback atoms
     even when the warp N slice is divisible by 16. The retry may reduce
     performance. Set to False to restore the strict fail-fast behavior.
+
+    Only effective on PPU0015+ targets: PPU0010 has no m16n8 MMA atoms,
+    so layout collection there always fails fast with the original error.
     """
 
     TL_PPU_FORCE_GEMM_N8 = "tl.ppu_force_gemm_n8"

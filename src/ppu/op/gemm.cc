@@ -164,14 +164,17 @@ struct Gemm {
                        int block_size, Target target, String gemm_inst) {
     int num_warps = block_size / TargetPPUGetWarpSize(target);
     // PPU MMA uses m16n16 tiles, so each warp needs at least 16 columns.
-    // N divisible only by 8 (m16n8k* fallback shapes) or the retry-set
-    // tl.ppu_force_gemm_n8 config relaxes kNPerWarp to 8; otherwise keep 16
-    // to preserve the historical partition.
-    bool force_gemm_n8 = tvm::transform::PassContext::Current()
-                             ->GetConfig<Bool>(kPpuForceGemmN8, Bool(false))
-                             .value();
-    const int kNPerWarp = (force_gemm_n8 || N % 16 != 0) ? 8 : 16;
-    return ComputeDefaultWarpPartition(policy, M, N, num_warps, kNPerWarp);
+    // On PPU0015+, N divisible only by 8 (m16n8k* fallback shapes) or the
+    // retry-set tl.ppu_force_gemm_n8 config relaxes kNPerWarp to 8. The
+    // m16n8 atoms do not exist on PPU0010, which keeps kNPerWarp = 16.
+    int k_n_per_warp = 16;
+    if (GetPPUArchInt(target) >= 15) {
+      bool force_gemm_n8 = tvm::transform::PassContext::Current()
+                               ->GetConfig<Bool>(kPpuForceGemmN8, Bool(false))
+                               .value();
+      k_n_per_warp = (force_gemm_n8 || N % 16 != 0) ? 8 : 16;
+    }
+    return ComputeDefaultWarpPartition(policy, M, N, num_warps, k_n_per_warp);
   }
 
   static bool ReuseExistingSharedLayout(String /* gemm_inst */) {
