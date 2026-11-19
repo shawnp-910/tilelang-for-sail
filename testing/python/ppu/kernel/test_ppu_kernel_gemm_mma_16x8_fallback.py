@@ -24,6 +24,10 @@ mixes and fp4 are not covered here. PPU0010 does not support the fallback
 All cases must match the torch reference. ``warp_col_tiles = block_N //
 n_warp``; with block_M = 32 and the default Square warp policy all cases
 below get n_warp = 1, so warp_col_tiles equals block_N.
+
+The ``_nt`` cases feed a transposed, N-major B operand (global shape
+``(N, K)``, ``T.gemm(..., False, True)``) to cover the fallback's N-major
+B shared-memory mappings in mma_macro_generator.py.
 """
 
 import tilelang
@@ -64,25 +68,37 @@ def matmul(
     num_stages,
     threads,
     b_in_dtype=None,
+    trans_A=False,
+    trans_B=False,
 ):
     if b_in_dtype is None:
         b_in_dtype = in_dtype
+    A_shape = (K, M) if trans_A else (M, K)
+    B_shape = (N, K) if trans_B else (K, N)
+    A_shared_shape = (block_K, block_M) if trans_A else (block_M, block_K)
+    B_shared_shape = (block_N, block_K) if trans_B else (block_K, block_N)
 
     @T.prim_func
     def main(
-        A: T.Tensor((M, K), in_dtype),
-        B: T.Tensor((K, N), b_in_dtype),
+        A: T.Tensor(A_shape, in_dtype),
+        B: T.Tensor(B_shape, b_in_dtype),
         C: T.Tensor((M, N), out_dtype),
     ):
         with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=threads) as (bx, by):
-            A_shared = T.alloc_shared((block_M, block_K), in_dtype)
-            B_shared = T.alloc_shared((block_K, block_N), b_in_dtype)
+            A_shared = T.alloc_shared(A_shared_shape, in_dtype)
+            B_shared = T.alloc_shared(B_shared_shape, b_in_dtype)
             C_local = T.alloc_fragment((block_M, block_N), accum_dtype)
             T.clear(C_local)
             for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=num_stages):
-                T.copy(A[by * block_M, k * block_K], A_shared)
-                T.copy(B[k * block_K, bx * block_N], B_shared)
-                T.gemm(A_shared, B_shared, C_local, False, False)
+                if trans_A:
+                    T.copy(A[k * block_K, by * block_M], A_shared)
+                else:
+                    T.copy(A[by * block_M, k * block_K], A_shared)
+                if trans_B:
+                    T.copy(B[bx * block_N, k * block_K], B_shared)
+                else:
+                    T.copy(B[k * block_K, bx * block_N], B_shared)
+                T.gemm(A_shared, B_shared, C_local, trans_A, trans_B)
             T.copy(C_local, C[by * block_M, bx * block_N])
 
     return main
@@ -101,6 +117,8 @@ def run_gemm(
     num_stages=0,
     num_threads=128,
     b_in_dtype=None,
+    trans_A=False,
+    trans_B=False,
 ):
     program = matmul(
         M,
@@ -115,6 +133,8 @@ def run_gemm(
         num_stages,
         num_threads,
         b_in_dtype,
+        trans_A,
+        trans_B,
     )
 
     kernel = tilelang.compile(program, out_idx=[2])
@@ -123,6 +143,10 @@ def run_gemm(
     def ref_program(A, B):
         import torch
 
+        if trans_A:
+            A = A.T
+        if trans_B:
+            B = B.T
         if in_dtype in (T.tfloat32, T.float32):
             # Convert float32 to tfloat32 because tfloat32 mma cannot truncate
             # float32 automatically, -0x1000 means
@@ -132,11 +156,12 @@ def run_gemm(
         C = C.to(torch.__getattribute__(out_dtype))
         return C
 
+    B_shape = (N, K) if trans_B else (K, N)
     _b = b_in_dtype if b_in_dtype is not None else in_dtype
     if _is_fp8_dtype(in_dtype) or _is_fp8_dtype(_b):
         # fp8 tolerance follows the main-path fp8 gemm cases
         # (testing/python/ppu/kernel/test_ppu_kernel_gemm.py).
-        ins = _gen_fp8_inputs((M, K), (K, N), in_dtype, _b)
+        ins = _gen_fp8_inputs((M, K), B_shape, in_dtype, _b)
         profiler.assert_allclose(ref_program, input_tensors=ins, atol=1e-2, rtol=1e-2)
     else:
         profiler.assert_allclose(ref_program, atol=1e-2, rtol=1e-2)
@@ -525,6 +550,248 @@ def test_ppu_gemm_mma_16x8_fallback_e5m2e5m2f32_n24():
         T.float32,
         0,
         128,
+    )
+
+
+# ---------------------------------------------------------------------------
+# N-major B (trans_B=True) cases: cover the fallback's N-major B
+# shared-memory mappings in mma_macro_generator.py
+# ---------------------------------------------------------------------------
+
+
+@tilelang.testing.requires_ppu
+@tilelang.testing.requires_ppu_compute_version_ge(1, 5)
+def test_ppu_gemm_mma_16x8_fallback_f16f16f32_nt_n8():
+    # trans_B = True, warp_col_tiles = 8 -> m16n8k16 atom with the N-major B
+    # mapping ldmatrix_32x4_to_shared_8x16_layout_b_fp16.
+    run_gemm(
+        128,
+        64,
+        128,
+        32,
+        8,
+        32,
+        T.float16,
+        T.float32,
+        T.float32,
+        0,
+        128,
+        trans_B=True,
+    )
+
+
+@tilelang.testing.requires_ppu
+@tilelang.testing.requires_ppu_compute_version_ge(1, 5)
+def test_ppu_gemm_mma_16x8_fallback_f16f16f32_nt_n24():
+    # trans_B = True, warp_col_tiles = 24 (16 + 8 mixed) -> m16n8k16 atom
+    # with the N-major B mapping ldmatrix_32x4_to_shared_8x16_layout_b_fp16.
+    run_gemm(
+        128,
+        48,
+        128,
+        32,
+        24,
+        32,
+        T.float16,
+        T.float32,
+        T.float32,
+        0,
+        128,
+        trans_B=True,
+    )
+
+
+@tilelang.testing.requires_ppu
+@tilelang.testing.requires_ppu_compute_version_ge(1, 5)
+def test_ppu_gemm_mma_16x8_fallback_bf16bf16f32_nt_n8():
+    # trans_B = True, warp_col_tiles = 8 -> m16n8k16 atom with bf16 operands
+    # reusing the fp16 N-major B mapping
+    # ldmatrix_32x4_to_shared_8x16_layout_b_fp16.
+    run_gemm(
+        128,
+        64,
+        128,
+        32,
+        8,
+        32,
+        T.bfloat16,
+        T.float32,
+        T.float32,
+        0,
+        128,
+        trans_B=True,
+    )
+
+
+@tilelang.testing.requires_ppu
+@tilelang.testing.requires_ppu_compute_version_ge(1, 5)
+def test_ppu_gemm_mma_16x8_fallback_tf32f32f32_nt_n8():
+    # trans_B = True, warp_col_tiles = 8 -> m16n8k8 atom with the tf32
+    # N-major B mapping ldmatrix_32x2_to_shared_8x8_layout_b_fp32.
+    run_gemm(
+        128,
+        64,
+        128,
+        32,
+        8,
+        32,
+        T.tfloat32,
+        T.float32,
+        T.float32,
+        0,
+        128,
+        trans_B=True,
+    )
+
+
+@tilelang.testing.requires_ppu
+@tilelang.testing.requires_ppu_compute_version_ge(1, 5)
+def test_ppu_gemm_mma_16x8_fallback_tf32f32f32_nt_n24():
+    # trans_B = True, warp_col_tiles = 24 (16 + 8 mixed) -> m16n8k8 atom
+    # with the tf32 N-major B mapping
+    # ldmatrix_32x2_to_shared_8x8_layout_b_fp32.
+    run_gemm(
+        128,
+        48,
+        128,
+        32,
+        24,
+        32,
+        T.tfloat32,
+        T.float32,
+        T.float32,
+        0,
+        128,
+        trans_B=True,
+    )
+
+
+@tilelang.testing.requires_ppu
+@tilelang.testing.requires_ppu_compute_version_ge(1, 5)
+def test_ppu_gemm_mma_16x8_fallback_f16f16f16_nt_n8():
+    # trans_B = True, warp_col_tiles = 8 -> m16n8k16 atom with an fp16
+    # accumulator and the N-major B mapping
+    # ldmatrix_32x4_to_shared_8x16_layout_b_fp16.
+    run_gemm(
+        128,
+        64,
+        128,
+        32,
+        8,
+        32,
+        T.float16,
+        T.float16,
+        T.float16,
+        0,
+        128,
+        trans_B=True,
+    )
+
+
+@tilelang.testing.requires_ppu
+@tilelang.testing.requires_ppu_compute_version_ge(1, 5)
+def test_ppu_gemm_mma_16x8_fallback_i8i8i32_nt_n8():
+    # trans_B = True, warp_col_tiles = 8 -> m16n8k32 atom with the int8
+    # N-major B mapping ldmatrix_32x8_to_shared_8x32_layout_b.
+    run_gemm(
+        128,
+        64,
+        128,
+        32,
+        8,
+        64,
+        T.int8,
+        T.int32,
+        T.int32,
+        0,
+        128,
+        trans_B=True,
+    )
+
+
+@tilelang.testing.requires_ppu
+@tilelang.testing.requires_ppu_compute_version_ge(1, 5)
+def test_ppu_gemm_mma_16x8_fallback_i8i8i32_nt_n24():
+    # trans_B = True, warp_col_tiles = 24 (16 + 8 mixed) -> m16n8k32 atom
+    # with the int8 N-major B mapping ldmatrix_32x8_to_shared_8x32_layout_b.
+    run_gemm(
+        128,
+        48,
+        128,
+        32,
+        24,
+        64,
+        T.int8,
+        T.int32,
+        T.int32,
+        0,
+        128,
+        trans_B=True,
+    )
+
+
+@tilelang.testing.requires_ppu
+@tilelang.testing.requires_ppu_compute_version_ge(1, 5)
+def test_ppu_gemm_mma_16x8_fallback_e4m3e4m3f32_nt_n8():
+    # trans_B = True, warp_col_tiles = 8 -> m16n8k32 fp8 atom with the fp8
+    # N-major B mapping ldmatrix_32x8_to_shared_8x32_layout_b.
+    run_gemm(
+        128,
+        64,
+        128,
+        32,
+        8,
+        32,
+        T.float8_e4m3fn,
+        T.float32,
+        T.float32,
+        0,
+        128,
+        trans_B=True,
+    )
+
+
+@tilelang.testing.requires_ppu
+@tilelang.testing.requires_ppu_compute_version_ge(1, 5)
+def test_ppu_gemm_mma_16x8_fallback_e4m3e4m3f32_nt_n24():
+    # trans_B = True, warp_col_tiles = 24 (16 + 8 mixed) -> m16n8k32 fp8
+    # atom with the N-major B mapping
+    # ldmatrix_32x8_to_shared_8x32_layout_b.
+    run_gemm(
+        128,
+        48,
+        128,
+        32,
+        24,
+        32,
+        T.float8_e4m3fn,
+        T.float32,
+        T.float32,
+        0,
+        128,
+        trans_B=True,
+    )
+
+
+@tilelang.testing.requires_ppu
+@tilelang.testing.requires_ppu_compute_version_ge(1, 5)
+def test_ppu_gemm_mma_16x8_fallback_e4m3e5m2f32_nt_n8():
+    # trans_B = True, warp_col_tiles = 8 -> m16n8k32 fp8 atom, e4m3 A x
+    # e5m2 B, exercising the mixed-dtype N-major B cast path.
+    run_gemm(
+        128,
+        64,
+        128,
+        32,
+        8,
+        32,
+        T.float8_e4m3fn,
+        T.float32,
+        T.float32,
+        0,
+        128,
+        b_in_dtype=T.float8_e5m2,
+        trans_B=True,
     )
 
 
