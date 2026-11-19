@@ -15,11 +15,9 @@ config pair added on top of the PPU0015 gemm m16n8 fallback:
   ``_initialize_micro_size`` / ``_use_m16n8_fallback``. Written by the
   retry above; can also be set manually to reproduce the fallback path.
 
-A genuine "N % 16 == 0 gemm + a sibling op raising LayoutConflictException"
-repro was not constructed here: no ready-made repro exists in the v0.1.8
-testing tree either, and this suite is validated remotely, so a
-hand-crafted conflict kernel could not be confirmed locally. The fallback
-verification below therefore uses:
+The suite also carries a genuine "N % 16 == 0 gemm + a sibling op raising
+LayoutConflictException" repro: a reduce_sum whose annotated dst fragment
+only matches the m16n8-forced C layout. The verification below uses:
 
 1. direct force-mechanism tests: an N % 16 == 0 kernel compiled with
    ``tl.ppu_force_gemm_n8 = True`` must take the n8 micro-tile path
@@ -30,7 +28,10 @@ verification below therefore uses:
    a PPU0010 kernel whose warp N slice is a multiple of 8 only makes the
    first collection fail, the retry flip happen, and the second failure
    escape with the retry-aware message; disabling the total switch must
-   instead let the first error escape untouched.
+   instead let the first error escape untouched;
+3. the real repro: with compatibility disabled the raw LayoutConflict
+   error escapes; with the default config the retry succeeds and both
+   outputs match the torch reference.
 
 With block_M = 64, block_N = 16 and threads = 128 (4 warps, Square policy):
 - default: kNPerWarp = 16 -> (m_warp, n_warp) = (4, 1) ->
@@ -48,6 +49,7 @@ import tilelang.language as T
 
 from tilelang.transform import PassConfigKey
 from tilelang.ppu.intrinsics.macro.mma_macro_generator import PPUTensorCoreIntrinEmitter
+from tilelang.env import CacheState
 
 
 def matmul(M, N, K, block_M, block_N, block_K, in_dtype, out_dtype, accum_dtype):
@@ -86,6 +88,8 @@ def _spy_micro_size(monkeypatch):
         records.append((self.warp_col_tiles, self.n_dim))
 
     monkeypatch.setattr(PPUTensorCoreIntrinEmitter, "_initialize_micro_size", spy)
+    # Disable the kernel cache so a warm JIT cache cannot bypass the spy.
+    monkeypatch.setattr(CacheState, "_enabled", False)
     return records
 
 
@@ -295,6 +299,89 @@ def test_force_gemm_n8_uint8_unsupported_dtype():
             out_idx=[2],
             pass_configs={PassConfigKey.TL_PPU_FORCE_GEMM_N8: True},
         )
+
+
+# ---------------------------------------------------------------------------
+# Real LayoutConflictException repro: block_N = 16 (N % 16 == 0) gemm plus
+# a reduce_sum whose annotated dst fragment only matches the m16n8-forced C
+# layout, so the first (m16n16) collection raises in ReduceOp::InferLayout.
+# ---------------------------------------------------------------------------
+
+
+def _reduce_conflict_program():
+    # Thread maps (block_M=64, block_N=16, threads=128, Square policy):
+    # - default n16 partition (m_warp, n_warp) = (4, 1): C fragment
+    #   thread(i, j) = 32*(i//16) + 4*(i%8) + (j%8)//2;
+    # - forced n8 partition (2, 2): C fragment thread(i, j) =
+    #   64*(j//8) + 32*(i//32) + 4*(i%8) + (j%8)//2.
+    # The reducer layout derived from the n16 C fragment holds element i on
+    # {32*(i//16) + 4*(i%8) + c} (4 threads), while R_local is annotated with
+    # the n8 holder set {64*b + 32*(i//32) + 4*(i%8) + c} (8 threads) — a
+    # real conflict for the first collection and a match for the retried one.
+    M, N, K = 128, 16, 128
+    BM, BK = 64, 32
+
+    def r_forward(i, rep):
+        thread = 64 * (rep // 4) + 32 * (i // 32) + 4 * (i % 8) + rep % 4
+        index = (i % 32) // 8
+        return thread, index
+
+    r_layout = T.Fragment((BM,), forward_fn=r_forward, replicate=8)
+
+    @T.prim_func
+    def main(
+        A: T.Tensor((M, K), "float16"),
+        B: T.Tensor((K, N), "float16"),
+        C: T.Tensor((M, N), "float32"),
+        D: T.Tensor((M,), "float32"),
+    ):
+        with T.Kernel(T.ceildiv(M, BM), threads=128) as (by):
+            A_shared = T.alloc_shared((BM, BK), "float16")
+            B_shared = T.alloc_shared((BK, N), "float16")
+            C_local = T.alloc_fragment((BM, N), "float32")
+            R_local = T.alloc_fragment((BM,), "float32")
+            T.annotate_layout({R_local: r_layout})
+            T.clear(C_local)
+            for k in T.Pipelined(T.ceildiv(K, BK), num_stages=0):
+                T.copy(A[by * BM, k * BK], A_shared)
+                T.copy(B[k * BK, 0], B_shared)
+                T.gemm(A_shared, B_shared, C_local, False, False)
+            T.reduce_sum(C_local, R_local, clear=True)
+            T.copy(C_local, C[by * BM, 0])
+            T.copy(R_local, D[by * BM])
+
+    return main
+
+
+def _gemm_reduce_ref(A, B):
+    C = torch.matmul(A.to(torch.float32), B.to(torch.float32))
+    D = C.sum(dim=1)
+    return C, D
+
+
+@tilelang.testing.requires_ppu
+@tilelang.testing.requires_ppu_compute_version_ge(1, 5)
+def test_real_layout_conflict_compat_disabled_raises():
+    # The real LayoutConflictException repro with the total switch off: no
+    # catch/retry happens, so the raw first-collection conflict error must
+    # escape untouched.
+    program = _reduce_conflict_program()
+    with pytest.raises(Exception, match="Layout may conflict with ReduceOp"):
+        tilelang.compile(
+            program,
+            out_idx=[2, 3],
+            pass_configs={PassConfigKey.TL_PPU_ENABLE_N8_COMPAT: False},
+        )
+
+
+@tilelang.testing.requires_ppu
+@tilelang.testing.requires_ppu_compute_version_ge(1, 5)
+def test_real_layout_conflict_retry_n8_matches_reference():
+    # With default configs the retry flips tl.ppu_force_gemm_n8 on and both
+    # outputs (C, D) must match the torch reference.
+    program = _reduce_conflict_program()
+    kernel = tilelang.compile(program, out_idx=[2, 3])
+    kernel.get_profiler().assert_allclose(_gemm_reduce_ref, atol=1e-2, rtol=1e-2)
 
 
 if __name__ == "__main__":
