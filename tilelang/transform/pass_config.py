@@ -139,6 +139,10 @@ class PassConfigKey(str, Enum):
     even when the warp N slice is divisible by 16. The retry may reduce
     performance. Set to False to restore the strict fail-fast behavior.
 
+    The retry decision is persisted per function (``tl.ppu_n8_forced``
+    attribute): the Lower stage re-enables the flag only for retried
+    functions; a failed retry rethrows the original error.
+
     Only effective on PPU0015+ targets: PPU0010 has no m16n8 MMA atoms,
     so layout collection there always fails fast with the original error.
     """
@@ -148,10 +152,12 @@ class PassConfigKey(str, Enum):
 
     When True, the gemm warp partition uses kNPerWarp = 8 (instead of 16
     whenever N % 16 == 0) and the MMA emitter selects m16n8 atoms even for
-    warp N slices divisible by 16. This is normally written by the PPU
-    LayoutInference pass during the ``tl.ppu_enable_n8_compat`` retry; it can
-    also be set manually to reproduce the fallback code path for N % 16 == 0
-    shapes.
+    warp N slices divisible by 16. Normally set per function by the PPU
+    LayoutInference pass during the ``tl.ppu_enable_n8_compat`` retry; can
+    also be set manually to reproduce the fallback code path for
+    N % 16 == 0 shapes.
+
+    Only effective on PPU0015+ targets.
     """
 
     TL_ENABLE_LOWER_LDGSTG = "tl.enable_lower_ldgstg"
